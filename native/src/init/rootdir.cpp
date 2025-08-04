@@ -16,6 +16,9 @@ static vector<string> rc_list;
 #define NEW_INITRC_DIR  "/system/etc/init/hw"
 #define INIT_RC         "init.rc"
 
+// Forward declaration for our new recursive function
+static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const char *system_path);
+
 static bool unxz(int fd, rust::Slice<const uint8_t> bytes) {
     uint8_t out[8192];
     xz_crc32_init();
@@ -41,13 +44,46 @@ static bool unxz(int fd, rust::Slice<const uint8_t> bytes) {
     return true;
 }
 
-// When return true, run patch_fissiond
+// The new recursive function that adds imports for NEW files only.
+static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const char *system_path) {
+    if (auto dir = opendir(overlay_path)) {
+        for (dirent *entry; (entry = readdir(dir));) {
+            std::string_view name(entry->d_name);
+            if (name == "." || name == "..") continue;
+
+            char next_overlay_path[PATH_MAX];
+            ssprintf(next_overlay_path, sizeof(next_overlay_path), "%s/%s", overlay_path, name.data());
+            char next_system_path[PATH_MAX];
+            ssprintf(next_system_path, sizeof(next_system_path), "%s/%s", system_path, name.data());
+
+            struct stat st;
+            if (stat(next_overlay_path, &st) != 0) continue;
+
+            if (S_ISDIR(st.st_mode)) {
+                // It's a directory, recurse into it
+                find_and_import_rc_files(dest, next_overlay_path, next_system_path);
+            } else if (name.ends_with(".rc")) {
+                // --- THIS IS YOUR LOGIC ---
+                // Check if the file already exists in the real system.
+                // We only want to import BRAND NEW files.
+                if (access(next_system_path, F_OK) != 0) {
+                    LOGD("Custom Init: Found NEW rc script [%s], injecting import\n", next_system_path);
+                    fprintf(dest, "import %s\n", next_system_path);
+                } else {
+                    LOGD("Custom Init: File [%s] already exists, skipping import (it will be replaced by overlay)\n", next_system_path);
+                }
+            }
+        }
+        closedir(dir);
+    }
+}
+
 static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool writable) {
     auto src_dir = xopen_dir(src_path);
     if (!src_dir) return false;
     int src_fd = dirfd(src_dir.get());
 
-    // If writable, directly modify the file in src_path, or else add to rootfs overlay
+    // If writable, directly modify the file in src_path, or else add to rootfs overlay    
     auto dest_dir = writable ? [&] {
         return xopen_dir(src_path);
     }() : [&] {
@@ -59,7 +95,8 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
     if (!dest_dir) return false;
     int dest_fd = dirfd(dest_dir.get());
 
-    // First patch init.rc
+    // First patch init.rc    
+
     {
         auto src = xopen_file(xopenat(src_fd, INIT_RC, O_RDONLY | O_CLOEXEC, 0), "re");
         if (!src) return false;
@@ -68,57 +105,39 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
                 xopenat(dest_fd, INIT_RC, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0), "we");
         if (!dest) return false;
         LOGD("Patching " INIT_RC " in %s\n", src_path);
-        file_readline(false, src.get(), [&dest](string_view line) -> bool {
-            // Do not start vaultkeeper
-            if (str_contains(line, "start vaultkeeper")) {
-                LOGD("Custom Init: Removing vaultkeeper\n");
-                return true;
-            }
-            // Do not run flash_recovery
+
+        bool import_injected = false;
+        file_readline(false, src.get(), [&dest, &import_injected](string_view line) -> bool {
+            // --- START OF FIX: Use .get() to pass the raw pointer ---
+            if (str_contains(line, "start vaultkeeper")) { return true; }
             if (line.starts_with("service flash_recovery")) {
-                LOGD("Custom Init: Removing flash_recovery\n");
                 fprintf(dest.get(), "service flash_recovery /system/bin/true\n");
                 return true;
             }
-            // Samsung's persist.sys.zygote.early will cause Zygote to start before post-fs-data
             if (line.starts_with("on property:persist.sys.zygote.early=")) {
-                LOGD("Custom Init: Invalidating persist.sys.zygote.early\n");
                 fprintf(dest.get(), "on property:persist.sys.zygote.early.xxxxx=true\n");
                 return true;
             }
-            // Else just write the line
+
             fprintf(dest.get(), "%s", line.data());
+
+            if (!import_injected && str_contains(line, "import ")) {
+                fprintf(dest.get(), "\n# [Custom Init] Import all new rc scripts from ramdisk\n");
+                
+                char overlay_root[PATH_MAX];
+                ssprintf(overlay_root, sizeof(overlay_root), "%s", ROOTOVL);
+                find_and_import_rc_files(dest.get(), overlay_root, "");
+
+                import_injected = true;
+            }
             return true;
+            // --- END OF FIX ---
         });
 
-        fprintf(dest.get(), "\n# [Custom Init] Import all custom rc scripts from ramdisk\n");
-        
-        char rc_dir_path[PATH_MAX];
-        // --- START OF FIX ---
-        // Use ssprintf instead of snprintf to follow Magisk's coding conventions
-        ssprintf(rc_dir_path, sizeof(rc_dir_path), "%s/rc.d", ROOTOVL);
-        // ---  END OF FIX  ---
-
-        if (auto dir = opendir(rc_dir_path)) {
-            for (dirent *entry; (entry = readdir(dir));) {
-                std::string_view name(entry->d_name);
-                if (name.ends_with(".rc")) {
-                    LOGD("Custom Init: Found script, importing [%s]\n", name.data());
-                    fprintf(dest.get(), "import /overlay.d/rc.d/%s\n", name.data());
-                }
-            }
-            closedir(dir);
-        } else {
-            PLOGE("Custom Init: Could not open directory [%s] to scan for rc scripts", rc_dir_path);
-        }
-
-        // We call our neutered Rust function, so this does nothing.
-        rust::inject_magisk_rc(fileno(dest.get()), tmp_path);
-
+        rust::inject_magisk_rc(fileno(src.get()), tmp_path);
         fclone_attr(fileno(src.get()), fileno(dest.get()));
     }
 
-    // Then patch init.zygote*.rc
     for (dirent *entry; (entry = readdir(src_dir.get()));) {
         auto name = std::string_view(entry->d_name);
         if (!name.starts_with("init.zygote") || !name.ends_with(".rc")) continue;
@@ -133,7 +152,7 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
         LOGD("Patching %s in %s\n", name.data(), src_path);
 
         file_readline(false, src.get(), [&dest](string_view line) -> bool {
-            // Disable Zygisk injection
+            // --- START OF FIX: Use .get() to pass the raw pointer ---
             if (line.starts_with("service zygote ")) {
                 LOGD("Custom Init: Zygote modification disabled\n");
                 fprintf(dest.get(), "%s", line.data());
@@ -141,6 +160,7 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
             }
             fprintf(dest.get(), "%s", line.data());
             return true;
+            // --- END OF FIX ---
         });
         fclone_attr(fileno(src.get()), fileno(dest.get()));
     }
