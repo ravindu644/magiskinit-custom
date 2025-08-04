@@ -1,4 +1,5 @@
 #include <sys/mount.h>
+#include <libgen.h> // <-- THE TYPO IS FIXED HERE. IT IS .h, NOT .hh
 #include <dirent.h>
 
 #include <sepolicy.hpp>
@@ -14,9 +15,6 @@ static vector<string> rc_list;
 
 #define NEW_INITRC_DIR  "/system/etc/init/hw"
 #define INIT_RC         "init.rc"
-
-// Forward declaration for our new recursive function
-static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const char *system_path);
 
 static bool unxz(int fd, rust::Slice<const uint8_t> bytes) {
     uint8_t out[8192];
@@ -43,76 +41,6 @@ static bool unxz(int fd, rust::Slice<const uint8_t> bytes) {
     return true;
 }
 
-// Simple dirname implementation for nolibc environment
-static void get_parent_dir(const char *path, char *parent, size_t parent_size) {
-    strscpy(parent, path, parent_size);
-    char *last_slash = strrchr(parent, '/');
-    if (last_slash && last_slash != parent) {
-        *last_slash = '\0';
-    } else if (last_slash == parent) {
-        parent[1] = '\0';  // Root directory
-    } else {
-        strscpy(parent, ".", parent_size);  // No slash found
-    }
-}
-
-// The new recursive function that adds imports for NEW files only and mounts them.
-static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const char *system_path) {
-    if (auto dir = opendir(overlay_path)) {
-        for (dirent *entry; (entry = readdir(dir));) {
-            std::string_view name(entry->d_name);
-            if (name == "." || name == "..") continue;
-
-            char next_overlay_path[PATH_MAX];
-            ssprintf(next_overlay_path, sizeof(next_overlay_path), "%s/%s", overlay_path, name.data());
-            
-            char next_system_path[PATH_MAX];
-            // Fix: Handle the root system path case properly
-            if (strlen(system_path) == 0) {
-                ssprintf(next_system_path, sizeof(next_system_path), "/%s", name.data());
-            } else {
-                ssprintf(next_system_path, sizeof(next_system_path), "%s/%s", system_path, name.data());
-            }
-
-            struct stat st;
-            if (stat(next_overlay_path, &st) != 0) continue;
-
-            if (S_ISDIR(st.st_mode)) {
-                // It's a directory, create it in the real filesystem if it doesn't exist, and recurse.
-                mkdir(next_system_path, 0755);
-                find_and_import_rc_files(dest, next_overlay_path, next_system_path);
-            } else if (name.ends_with(".rc")) {
-                // Check if the file already exists in the real system.
-                if (access(next_system_path, F_OK) != 0) {
-                    LOGD("Custom Init: Found NEW rc script [%s], injecting and mounting\n", next_system_path);
-                    
-                    // --- THE FINAL FIX ---
-                    // Create the directory structure if it doesn't exist
-                    char parent_dir[PATH_MAX];
-                    get_parent_dir(next_system_path, parent_dir, sizeof(parent_dir));
-                    xmkdirs(parent_dir, 0755);
-                    
-                    // Create a dummy file at the destination.
-                    close(xopen(next_system_path, O_RDONLY | O_CREAT, 0644));
-                    // Bind mount our new file on top of the dummy file.
-                    if (xmount(next_overlay_path, next_system_path, nullptr, MS_BIND, nullptr) == 0) {
-                        LOGD("Custom Init: Successfully mounted [%s]\n", next_system_path);
-                        // Only add the import statement if the mount was successful.
-                        fprintf(dest, "import %s\n", next_system_path);
-                    } else {
-                        PLOGE("Custom Init: FAILED to mount [%s]", next_system_path);
-                    }
-                    // --- END OF FINAL FIX ---
-
-                } else {
-                    LOGD("Custom Init: File [%s] already exists, skipping import (will be replaced by main overlay system)\n", next_system_path);
-                }
-            }
-        }
-        closedir(dir);
-    }
-}
-
 static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool writable) {
     auto src_dir = xopen_dir(src_path);
     if (!src_dir) return false;
@@ -129,6 +57,7 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
     if (!dest_dir) return false;
     int dest_fd = dirfd(dest_dir.get());
 
+    // First patch init.rc
     {
         auto src = xopen_file(xopenat(src_fd, INIT_RC, O_RDONLY | O_CLOEXEC, 0), "re");
         if (!src) return false;
@@ -137,38 +66,49 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
                 xopenat(dest_fd, INIT_RC, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0), "we");
         if (!dest) return false;
         LOGD("Patching " INIT_RC " in %s\n", src_path);
-
-        bool import_injected = false;
-        file_readline(false, src.get(), [&dest, &import_injected, tmp_path](string_view line) -> bool {
-            if (str_contains(line, "start vaultkeeper")) { return true; }
+        file_readline(false, src.get(), [&dest](string_view line) -> bool {
+            // Do not start vaultkeeper
+            if (str_contains(line, "start vaultkeeper")) {
+                LOGD("Custom Init: Removing vaultkeeper\n");
+                return true;
+            }
+            // Do not run flash_recovery
             if (line.starts_with("service flash_recovery")) {
+                LOGD("Custom Init: Removing flash_recovery\n");
                 fprintf(dest.get(), "service flash_recovery /system/bin/true\n");
                 return true;
             }
+            // Samsung's persist.sys.zygote.early will cause Zygote to start before post-fs-data
             if (line.starts_with("on property:persist.sys.zygote.early=")) {
+                LOGD("Custom Init: Invalidating persist.sys.zygote.early\n");
                 fprintf(dest.get(), "on property:persist.sys.zygote.early.xxxxx=true\n");
                 return true;
             }
-
+            // Else just write the line
             fprintf(dest.get(), "%s", line.data());
-
-            if (!import_injected && str_contains(line, "import ")) {
-                fprintf(dest.get(), "\n# [Custom Init] Import all new rc scripts from ramdisk\n");
-                
-                // Fix: Start the search from the overlay root and map to actual system paths
-                char overlay_root[PATH_MAX];
-                ssprintf(overlay_root, sizeof(overlay_root), "%s", ROOTOVL);
-                find_and_import_rc_files(dest.get(), overlay_root, "");
-
-                import_injected = true;
-            }
             return true;
         });
 
-        rust::inject_magisk_rc(fileno(src.get()), tmp_path);
+        fprintf(dest.get(), "\n");
+
+        // --- THIS IS THE OFFICIAL MAGISK WAY ---
+        // Inject the content of any new *.rc files found by load_overlay_rc
+        for (auto &script : rc_list) {
+            // Replace template arguments, as per official documentation
+            replace_all(script, "${MAGISKTMP}", tmp_path);
+            fprintf(dest.get(), "\n%s\n", script.c_str());
+        }
+        rc_list.clear();
+        // --- END OF OFFICIAL METHOD ---
+
+
+        // We call our neutered Rust function, which does nothing.
+        rust::inject_magisk_rc(fileno(dest.get()), tmp_path);
+
         fclone_attr(fileno(src.get()), fileno(dest.get()));
     }
 
+    // Then patch init.zygote*.rc
     for (dirent *entry; (entry = readdir(src_dir.get()));) {
         auto name = std::string_view(entry->d_name);
         if (!name.starts_with("init.zygote") || !name.ends_with(".rc")) continue;
@@ -183,6 +123,7 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
         LOGD("Patching %s in %s\n", name.data(), src_path);
 
         file_readline(false, src.get(), [&dest](string_view line) -> bool {
+            // Disable Zygisk injection
             if (line.starts_with("service zygote ")) {
                 LOGD("Custom Init: Zygote modification disabled\n");
                 fprintf(dest.get(), "%s", line.data());
