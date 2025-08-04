@@ -30,18 +30,6 @@ static void parse_device(devinfo *dev, const char *uevent) {
     dev->devpath[0] = '\0';
     dev->dmname[0] = '\0';
     dev->devname[0] = '\0';
-    parse_prop_file(uevent, [=](string_view key, string_view value) -> bool {
-        if (key == "MAJOR")
-            dev->major = parse_int(value.data());
-        else if (key == "MINOR")
-            dev->minor = parse_int(value.data());
-        else if (key == "DEVNAME")
-            strscpy(dev->devname, value.data(), sizeof(dev->devname));
-        else if (key == "PARTNAME")
-            strscpy(dev->partname, value.data(), sizeof(dev->devname));
-
-        return true;
-    });
 }
 
 void MagiskInit::collect_devices() const noexcept {
@@ -100,46 +88,6 @@ uint64_t MagiskInit::find_block(const char *partname) const noexcept {
 
     // The requested partname does not exist
     return 0;
-}
-
-void MagiskInit::mount_preinit_dir() noexcept {
-    if (preinit_dev.empty()) return;
-    auto dev = find_block(preinit_dev.c_str());
-    if (dev == 0) {
-        LOGE("Cannot find preinit %s, abort!\n", preinit_dev.c_str());
-        return;
-    }
-    xmknod(PREINITDEV, S_IFBLK | 0600, dev);
-    xmkdir(MIRRDIR, 0);
-    bool mounted = false;
-    // First, find if it is already mounted
-    std::string mnt_point;
-    if (rust::is_device_mounted(dev, mnt_point)) {
-        // Already mounted, just bind mount
-        xmount(mnt_point.data(), MIRRDIR, nullptr, MS_BIND, nullptr);
-        mounted = true;
-    }
-
-    // Since we are mounting the block device directly, make sure to ONLY mount the partitions
-    // as read-only, or else the kernel might crash due to crappy drivers.
-    // After the device boots up, magiskd will properly symlink the correct path at PREINITMIRR as writable.
-    if (mounted || mount(PREINITDEV, MIRRDIR, "ext4", MS_RDONLY, nullptr) == 0 ||
-        mount(PREINITDEV, MIRRDIR, "f2fs", MS_RDONLY, nullptr) == 0) {
-        string preinit_dir = resolve_preinit_dir(MIRRDIR);
-        // Create bind mount
-        xmkdirs(PREINITMIRR, 0);
-        if (access(preinit_dir.data(), F_OK)) {
-            LOGW("empty preinit: %s\n", preinit_dir.data());
-        } else {
-            LOGD("preinit: %s\n", preinit_dir.data());
-            xmount(preinit_dir.data(), PREINITMIRR, nullptr, MS_BIND, nullptr);
-        }
-        xumount2(MIRRDIR, MNT_DETACH);
-    } else {
-        PLOGE("Mount preinit %s", preinit_dev.c_str());
-        // Do NOT delete the block device. Even though we cannot mount it here,
-        // it might get formatted later in the boot process.
-    }
 }
 
 bool MagiskInit::mount_system_root() noexcept {
@@ -216,11 +164,6 @@ void MagiskInit::setup_tmp(const char *path) noexcept {
     xmkdir(INTLROOT, 0711);
     xmkdir(DEVICEDIR, 0711);
     xmkdir(WORKERDIR, 0);
-
-    mount_preinit_dir();
-
-    cp_afc(".backup/.magisk", MAIN_CONFIG);
-    rm_rf(".backup");
 
     // Create applet symlinks
     for (int i = 0; applet_names[i]; ++i)

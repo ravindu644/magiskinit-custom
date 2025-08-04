@@ -62,9 +62,7 @@ static kv_pairs parse_impl(chars<padding...>, string_view str) {
 static kv_pairs parse_cmdline(string_view str) {
     return parse_impl<' ', '='>(chars<>{}, str);
 }
-static kv_pairs parse_bootconfig(string_view str) {
-    return parse_impl<'\n', '='>(chars<' '>{}, str);
-}
+
 static kv_pairs parse_partition_map(std::string_view str) {
     return parse_impl<';', ','>(chars<>{}, str);
 }
@@ -72,7 +70,7 @@ static kv_pairs parse_partition_map(std::string_view str) {
 #define test_bit(bit, array) (array[bit / 8] & (1 << (bit % 8)))
 
 static bool check_key_combo() {
-    LOGD("Running in recovery mode, waiting for key...\n");
+    LOGD("Custom Init: Running in recovery mode, waiting for key...\n");
     uint8_t bitmask[(KEY_MAX + 1) / 8];
     vector<int> events;
     constexpr const char *name = "/event";
@@ -108,7 +106,7 @@ static bool check_key_combo() {
             }
         }
         if (count >= 300) {
-            LOGD("KEY_VOLUMEUP detected: disable system-as-root\n");
+            LOGD("Custom Init: KEY_VOLUMEUP detected: disable system-as-root\n");
             return true;
         }
         // Check every 10ms
@@ -169,15 +167,6 @@ if (access(file_name, R_OK) == 0) {                                 \
 
 void BootConfig::init() noexcept {
     set(parse_cmdline(full_read("/proc/cmdline")));
-    set(parse_bootconfig(full_read("/proc/bootconfig")));
-
-    parse_prop_file("/.backup/.magisk", [&](auto key, auto value) -> bool {
-        if (key == "RECOVERYMODE" && value == "true") {
-            skip_initramfs = emulator || !check_key_combo();
-            return false;
-        }
-        return true;
-    });
 
     if (dt_dir[0] == '\0')
         strscpy(dt_dir.data(), DEFAULT_DT_DIR, dt_dir.size());
@@ -187,6 +176,12 @@ void BootConfig::init() noexcept {
     read_dt("hardware", hardware)
     read_dt("hardware.platform", hardware_plat)
 
-    LOGD("Device config:\n");
+    LOGD("********************************************\n");
+    LOGD("*              Hello World !               *\n");
+    LOGD("*         Custom MagiskInit Started !      *\n");
+    LOGD("*            - ravindu644                  *\n");
+    LOGD("********************************************\n");
+
+    LOGD("Custom Init: Device config:\n");
     print();
 }

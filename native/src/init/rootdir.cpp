@@ -1,5 +1,6 @@
 #include <sys/mount.h>
 #include <libgen.h>
+#include <dirent.h>
 
 #include <sepolicy.hpp>
 #include <consts.hpp>
@@ -66,22 +67,22 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
         auto dest = xopen_file(
                 xopenat(dest_fd, INIT_RC, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0), "we");
         if (!dest) return false;
-        LOGD("Patching " INIT_RC " in %s\n", src_path);
+        LOGD("Custom Init: Patching " INIT_RC " in %s\n", src_path);
         file_readline(false, src.get(), [&dest](string_view line) -> bool {
             // Do not start vaultkeeper
             if (str_contains(line, "start vaultkeeper")) {
-                LOGD("Remove vaultkeeper\n");
+                LOGD("Custom Init: Remove vaultkeeper\n");
                 return true;
             }
             // Do not run flash_recovery
             if (line.starts_with("service flash_recovery")) {
-                LOGD("Remove flash_recovery\n");
+                LOGD("Custom Init: Remove flash_recovery\n");
                 fprintf(dest.get(), "service flash_recovery /system/bin/true\n");
                 return true;
             }
             // Samsung's persist.sys.zygote.early will cause Zygote to start before post-fs-data
             if (line.starts_with("on property:persist.sys.zygote.early=")) {
-                LOGD("Invalidate persist.sys.zygote.early\n");
+                LOGD("Custom Init: Invalidate persist.sys.zygote.early\n");
                 fprintf(dest.get(), "on property:persist.sys.zygote.early.xxxxx=true\n");
                 return true;
             }
@@ -116,13 +117,11 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
         auto dest = xopen_file(
                 xopenat(dest_fd, name.data(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0), "we");
         if (!dest) continue;
-        LOGD("Patching %s in %s\n", name.data(), src_path);
+        LOGD("Custom Init: Patching %s in %s\n", name.data(), src_path);
         file_readline(false, src.get(), [&dest, &tmp_path](string_view line) -> bool {
             if (line.starts_with("service zygote ")) {
-                LOGD("Inject zygote restart\n");
+                LOGD("Custom Init: Zygote modification disabled\n");
                 fprintf(dest.get(), "%s", line.data());
-                fprintf(dest.get(),
-                        "    onrestart exec " MAGISK_PROC_CON " 0 0 -- %s/magisk --zygote-restart\n", tmp_path);
                 return true;
             }
             fprintf(dest.get(), "%s", line.data());
@@ -136,13 +135,13 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
 
 void MagiskInit::patch_fissiond(const char *tmp_path) noexcept {
     {
-        LOGD("Patching fissiond\n");
+        LOGD("Custom Init: Patching fissiond\n");
         mmap_data fissiond("/system/bin/fissiond", false);
         for (size_t off : fissiond.patch(
                 "ro.build.system.fission_single_os",
                 "ro.build.system.xxxxxxxxxxxxxxxxx"))
         {
-            LOGD("Patch @ %08zX [ro.build.system.fission_single_os] -> "
+            LOGD("Custom Init: Patch @ %08zX [ro.build.system.fission_single_os] -> "
                  "[ro.build.system.xxxxxxxxxxxxxxxxx]\n", off);
         }
         mkdirs(ROOTOVL "/system/bin", 0755);
@@ -151,13 +150,13 @@ void MagiskInit::patch_fissiond(const char *tmp_path) noexcept {
             clone_attr("/system/bin/fissiond", ROOTOVL "/system/bin/fissiond");
         }
     }
-    LOGD("hijack isolated\n");
+    LOGD("Custom Init: hijack isolated\n");
     auto hijack = xopen_file("/sys/devices/system/cpu/isolated", "re");
     mkfifo(INTLROOT "/isolated", 0777);
     xmount(INTLROOT "/isolated", "/sys/devices/system/cpu/isolated", nullptr, MS_BIND, nullptr);
     if (!xfork()) {
         auto dest = xopen_file(INTLROOT "/isolated", "we");
-        LOGD("hijacked isolated\n");
+        LOGD("Custom Init: hijacked isolated\n");
         xumount2("/sys/devices/system/cpu/isolated", MNT_DETACH);
         unlink(INTLROOT "/isolated");
         string content;
@@ -190,9 +189,9 @@ static void load_overlay_rc(const char *overlay) {
         }
         strscpy(buf + 1, entry->d_name, sizeof(buf) - 1);
         if (access(buf, F_OK) == 0) {
-            LOGD("Replace rc script [%s]\n", entry->d_name);
+            LOGD("Custom Init: Replace rc script [%s]\n", entry->d_name);
         } else {
-            LOGD("Found rc script [%s]\n", entry->d_name);
+            LOGD("Custom Init: Found rc script [%s]\n", entry->d_name);
             int rc = xopenat(dfd, entry->d_name, O_RDONLY | O_CLOEXEC);
             rc_list.push_back(full_read(rc));
             close(rc);
@@ -231,24 +230,8 @@ static void recreate_sbin(const char *mirror, bool use_bind_mount) {
 }
 
 static void extract_files(bool sbin) {
-    const char *magisk_xz = sbin ? "/sbin/magisk.xz" : "magisk.xz";
-    const char *stub_xz = sbin ? "/sbin/stub.xz" : "stub.xz";
     const char *init_ld_xz = sbin ? "/sbin/init-ld.xz" : "init-ld.xz";
 
-    if (access(magisk_xz, F_OK) == 0) {
-        mmap_data magisk(magisk_xz);
-        unlink(magisk_xz);
-        int fd = xopen("magisk", O_WRONLY | O_CREAT, 0755);
-        unxz(fd, magisk);
-        close(fd);
-    }
-    if (access(stub_xz, F_OK) == 0) {
-        mmap_data stub(stub_xz);
-        unlink(stub_xz);
-        int fd = xopen("stub.apk", O_WRONLY | O_CREAT, 0);
-        unxz(fd, stub);
-        close(fd);
-    }
     if (access(init_ld_xz, F_OK) == 0) {
         mmap_data init_ld(init_ld_xz);
         unlink(init_ld_xz);
@@ -260,7 +243,6 @@ static void extract_files(bool sbin) {
 
 void MagiskInit::patch_ro_root() noexcept {
     mount_list.emplace_back("/data");
-    parse_config_file();
 
     string tmp_dir;
 
@@ -296,7 +278,7 @@ void MagiskInit::patch_ro_root() noexcept {
         mmap_data init("/init");
         // Force disable early mount on original init
         for (size_t off : init.patch("android,fstab", "xxx")) {
-            LOGD("Patch @ %08zX [android,fstab] -> [xxx]\n", off);
+            LOGD("Custom Init: Patch @ %08zX [android,fstab] -> [xxx]\n", off);
         }
         int dest = xopen(ROOTOVL "/init", O_CREAT | O_WRONLY | O_CLOEXEC, 0);
         xwrite(dest, init.buf(), init.sz());
@@ -338,7 +320,6 @@ void MagiskInit::patch_ro_root() noexcept {
 
 void MagiskInit::patch_rw_root() noexcept {
     mount_list.emplace_back("/data");
-    parse_config_file();
 
     // Create hardlink mirror of /sbin to /root
     mkdir("/root", 0777);
@@ -349,7 +330,6 @@ void MagiskInit::patch_rw_root() noexcept {
     load_overlay_rc("/overlay.d");
     mv_path("/overlay.d", "/");
     rm_rf("/data/overlay.d");
-    rm_rf("/.backup");
 
     // Patch init.rc
     if (patch_rc_scripts("/", "/sbin", true))
@@ -375,7 +355,7 @@ void MagiskInit::patch_rw_root() noexcept {
 
 int magisk_proxy_main(int, char *argv[]) {
     rust::setup_klog();
-    LOGD("%s\n", __FUNCTION__);
+    LOGD("Custom Init: %s\n", __FUNCTION__);
 
     // Mount rootfs as rw to do post-init rootfs patches
     xmount(nullptr, "/", nullptr, MS_REMOUNT, nullptr);
@@ -400,7 +380,7 @@ int magisk_proxy_main(int, char *argv[]) {
 }
 
 static void unxz_init(const char *init_xz, const char *init) {
-    LOGD("unxz %s -> %s\n", init_xz, init);
+    LOGD("Custom Init: unxz %s -> %s\n", init_xz, init);
     int fd = xopen(init, O_WRONLY | O_CREAT, 0777);
     unxz(fd, mmap_data{init_xz});
     close(fd);
@@ -409,7 +389,7 @@ static void unxz_init(const char *init_xz, const char *init) {
 }
 
 rust::Utf8CStr backup_init() {
-    if (access("/.backup/init.xz", F_OK) == 0)
-        unxz_init("/.backup/init.xz", "/.backup/init");
-    return "/.backup/init";
+    if (access("/real_init.xz", F_OK) == 0)
+        unxz_init("/real_init.xz", "/real_init");
+    return "/real_init";
 }

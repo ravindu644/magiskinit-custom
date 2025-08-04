@@ -18,7 +18,6 @@ use std::{
 impl MagiskInit {
     fn new(argv: *mut *mut c_char) -> Self {
         Self {
-            preinit_dev: String::new(),
             mount_list: Vec::new(),
             overlay_con: Vec::new(),
             argv,
@@ -98,7 +97,6 @@ impl MagiskInit {
     fn recovery(&self) {
         info!("Ramdisk is recovery, abort");
         self.restore_ramdisk_init();
-        cstr!("/.backup").remove_all().ok();
     }
 
     fn restore_ramdisk_init(&self) {

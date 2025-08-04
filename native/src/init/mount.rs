@@ -93,7 +93,6 @@ impl MagiskInit {
         .log_ok();
 
         cstr!("/init").copy_to(cstr!("/data/magiskinit")).log_ok();
-        cstr!("/.backup").copy_to(cstr!("/data/.backup")).log_ok();
         cstr!("/overlay.d")
             .copy_to(cstr!("/data/overlay.d"))
             .log_ok();

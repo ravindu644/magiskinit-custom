@@ -39,7 +39,6 @@ pub mod ffi {
     }
 
     struct MagiskInit {
-        preinit_dev: String,
         mount_list: Vec<String>,
         argv: *mut *mut c_char,
         config: BootConfig,
@@ -84,7 +83,6 @@ pub mod ffi {
     // MagiskInit
     extern "Rust" {
         type OverlayAttr;
-        fn parse_config_file(self: &mut MagiskInit);
         fn mount_overlay(self: &mut MagiskInit, dest: Utf8CStrRef);
         fn handle_sepolicy(self: &mut MagiskInit);
         fn restore_overlay_contexts(self: &MagiskInit);
@@ -98,7 +96,6 @@ pub mod ffi {
         // Used in C++
         unsafe fn setup_tmp(self: &mut MagiskInit, path: *const c_char);
         fn collect_devices(self: &MagiskInit);
-        fn mount_preinit_dir(self: &mut MagiskInit);
         unsafe fn find_block(self: &MagiskInit, partname: *const c_char) -> u64;
         unsafe fn patch_fissiond(self: &mut MagiskInit, tmp_path: *const c_char);
     }

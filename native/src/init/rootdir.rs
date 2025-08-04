@@ -14,50 +14,12 @@ use std::{
 };
 
 pub fn inject_magisk_rc(fd: RawFd, tmp_dir: &Utf8CStr) {
-    debug!("Injecting magisk rc");
-
-    let mut file = unsafe { File::from_raw_fd(fd) };
-
-    write!(
-        file,
-        r#"
-on post-fs-data
-    exec {0} 0 0 -- {1}/magisk --post-fs-data
-
-on property:vold.decrypt=trigger_restart_framework
-    exec {0} 0 0 -- {1}/magisk --service
-
-on nonencrypted
-    exec {0} 0 0 -- {1}/magisk --service
-
-on property:sys.boot_completed=1
-    exec {0} 0 0 -- {1}/magisk --boot-complete
-
-on property:init.svc.zygote=stopped
-    exec {0} 0 0 -- {1}/magisk --zygote-restart
-"#,
-        "u:r:magisk:s0", tmp_dir
-    )
-    .ok();
-
-    mem::forget(file)
+    debug!("Custom Init: MagiskSU injection is disabled.");
 }
 
 pub struct OverlayAttr(Utf8CString, Utf8CString);
 
 impl MagiskInit {
-    pub(crate) fn parse_config_file(&mut self) {
-        if let Ok(fd) = cstr!("/data/.backup/.magisk").open(O_RDONLY) {
-            let mut reader = BufReader::new(fd);
-            reader.foreach_props(|key, val| {
-                if key == "PREINITDEVICE" {
-                    self.preinit_dev = val.to_string();
-                    return false;
-                }
-                true
-            })
-        }
-    }
 
     fn mount_impl(
         &mut self,
