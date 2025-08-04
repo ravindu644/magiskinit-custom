@@ -58,7 +58,8 @@ LOCAL_STATIC_LIBRARIES := \
     libbase \
     libpolicy \
     libxz \
-    libinit-rs
+    libinit-rs \
+    libsepol
 
 LOCAL_SRC_FILES := \
     init/mount.cpp \
