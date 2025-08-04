@@ -1,6 +1,7 @@
 #include <sys/mount.h>
 #include <libgen.h>
 #include <dirent.h>
+#include <selinux/selinux.h> // Required for getfilecon/setfilecon
 
 #include <sepolicy.hpp>
 #include <consts.hpp>
@@ -15,6 +16,9 @@ static vector<string> rc_list;
 
 #define NEW_INITRC_DIR  "/system/etc/init/hw"
 #define INIT_RC         "init.rc"
+
+// Forward declaration for our new recursive function
+static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const char *system_path);
 
 static bool unxz(int fd, rust::Slice<const uint8_t> bytes) {
     uint8_t out[8192];
@@ -41,13 +45,64 @@ static bool unxz(int fd, rust::Slice<const uint8_t> bytes) {
     return true;
 }
 
-// When return true, run patch_fissiond
+// The new recursive function that does all the magic
+static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const char *system_path) {
+    if (auto dir = opendir(overlay_path)) {
+        for (dirent *entry; (entry = readdir(dir));) {
+            std::string_view name(entry->d_name);
+            if (name == "." || name == "..") continue;
+
+            char next_overlay_path[PATH_MAX];
+            ssprintf(next_overlay_path, sizeof(next_overlay_path), "%s/%s", overlay_path, name.data());
+            char next_system_path[PATH_MAX];
+            ssprintf(next_system_path, sizeof(next_system_path), "%s/%s", system_path, name.data());
+
+            struct stat s;
+            if (lstat(next_overlay_path, &s) != 0) continue;
+
+            if (S_ISDIR(s.st_mode)) {
+                // It's a directory, recurse into it
+                find_and_import_rc_files(dest, next_overlay_path, next_system_path);
+            } else if (name.ends_with(".rc")) {
+                // It's an RC file, perform the injection and SELinux magic
+                LOGD("Custom Init: Found new rc script at [%s]\n", next_system_path);
+
+                // --- START OF SELINUX MIMICKING ---
+                security_context_t parent_context = nullptr;
+                char parent_dir_path[PATH_MAX];
+                ssprintf(parent_dir_path, sizeof(parent_dir_path), "%s", system_path);
+
+                // Get the context of the parent directory on the real filesystem
+                if (getfilecon(parent_dir_path, &parent_context) < 0) {
+                    PLOGE("Custom Init: Could not get SELinux context for parent [%s]", parent_dir_path);
+                    // Fallback to a known-good context if we fail
+                    if (setfilecon(next_overlay_path, "u:object_r:system_file:s0") != 0) {
+                        PLOGE("Custom Init: Failed to set fallback context on [%s]", name.data());
+                    }
+                } else {
+                    // Apply the parent directory's context to our new file
+                    if (setfilecon(next_overlay_path, parent_context) == 0) {
+                        LOGD("Custom Init: Applied context [%s] to [%s]\n", parent_context, name.data());
+                    } else {
+                        PLOGE("Custom Init: Failed to set context on [%s]", name.data());
+                    }
+                    freecon(parent_context);
+                }
+                // ---  END OF SELINUX MIMICKING  ---
+
+                // Write the clean, final import path to init.rc
+                fprintf(dest, "import %s\n", next_system_path);
+            }
+        }
+        closedir(dir);
+    }
+}
+
 static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool writable) {
     auto src_dir = xopen_dir(src_path);
     if (!src_dir) return false;
     int src_fd = dirfd(src_dir.get());
 
-    // If writable, directly modify the file in src_path, or else add to rootfs overlay
     auto dest_dir = writable ? [&] {
         return xopen_dir(src_path);
     }() : [&] {
@@ -59,7 +114,6 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
     if (!dest_dir) return false;
     int dest_fd = dirfd(dest_dir.get());
 
-    // First patch init.rc
     {
         auto src = xopen_file(xopenat(src_fd, INIT_RC, O_RDONLY | O_CLOEXEC, 0), "re");
         if (!src) return false;
@@ -68,57 +122,44 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
                 xopenat(dest_fd, INIT_RC, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0), "we");
         if (!dest) return false;
         LOGD("Patching " INIT_RC " in %s\n", src_path);
-        file_readline(false, src.get(), [&dest](string_view line) -> bool {
-            // Do not start vaultkeeper
+
+        bool import_injected = false;
+        file_readline(false, src.get(), [&dest, &import_injected](string_view line) -> bool {
             if (str_contains(line, "start vaultkeeper")) {
                 LOGD("Custom Init: Removing vaultkeeper\n");
                 return true;
             }
-            // Do not run flash_recovery
             if (line.starts_with("service flash_recovery")) {
                 LOGD("Custom Init: Removing flash_recovery\n");
-                fprintf(dest.get(), "service flash_recovery /system/bin/true\n");
+                fprintf(dest, "service flash_recovery /system/bin/true\n");
                 return true;
             }
-            // Samsung's persist.sys.zygote.early will cause Zygote to start before post-fs-data
             if (line.starts_with("on property:persist.sys.zygote.early=")) {
                 LOGD("Custom Init: Invalidating persist.sys.zygote.early\n");
-                fprintf(dest.get(), "on property:persist.sys.zygote.early.xxxxx=true\n");
+                fprintf(dest, "on property:persist.sys.zygote.early.xxxxx=true\n");
                 return true;
             }
-            // Else just write the line
-            fprintf(dest.get(), "%s", line.data());
+
+            fprintf(dest, "%s", line.data());
+
+            // --- START OF THE "INJECT AT THE TOP" LOGIC ---
+            // After writing the first 'import' line, inject our own.
+            if (!import_injected && str_contains(line, "import ")) {
+                fprintf(dest, "\n# [Custom Init] Import all custom rc scripts from ramdisk overlay\n");
+                
+                // Start scanning from the root of the overlay for maximum flexibility
+                find_and_import_rc_files(dest, ROOTOVL, "");
+
+                import_injected = true;
+            }
+            // ---  END OF THE "INJECT AT THE TOP" LOGIC  ---
             return true;
         });
 
-        fprintf(dest.get(), "\n# [Custom Init] Import all custom rc scripts from ramdisk\n");
-        
-        char rc_dir_path[PATH_MAX];
-        // --- START OF FIX ---
-        // Use ssprintf instead of snprintf to follow Magisk's coding conventions
-        ssprintf(rc_dir_path, sizeof(rc_dir_path), "%s/rc.d", ROOTOVL);
-        // ---  END OF FIX  ---
-
-        if (auto dir = opendir(rc_dir_path)) {
-            for (dirent *entry; (entry = readdir(dir));) {
-                std::string_view name(entry->d_name);
-                if (name.ends_with(".rc")) {
-                    LOGD("Custom Init: Found script, importing [%s]\n", name.data());
-                    fprintf(dest.get(), "import /overlay.d/rc.d/%s\n", name.data());
-                }
-            }
-            closedir(dir);
-        } else {
-            PLOGE("Custom Init: Could not open directory [%s] to scan for rc scripts", rc_dir_path);
-        }
-
-        // We call our neutered Rust function, so this does nothing.
         rust::inject_magisk_rc(fileno(dest.get()), tmp_path);
-
         fclone_attr(fileno(src.get()), fileno(dest.get()));
     }
 
-    // Then patch init.zygote*.rc
     for (dirent *entry; (entry = readdir(src_dir.get()));) {
         auto name = std::string_view(entry->d_name);
         if (!name.starts_with("init.zygote") || !name.ends_with(".rc")) continue;
@@ -133,13 +174,12 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
         LOGD("Patching %s in %s\n", name.data(), src_path);
 
         file_readline(false, src.get(), [&dest](string_view line) -> bool {
-            // Disable Zygisk injection
             if (line.starts_with("service zygote ")) {
                 LOGD("Custom Init: Zygote modification disabled\n");
-                fprintf(dest.get(), "%s", line.data());
+                fprintf(dest, "%s", line.data());
                 return true;
             }
-            fprintf(dest.get(), "%s", line.data());
+            fprintf(dest, "%s", line.data());
             return true;
         });
         fclone_attr(fileno(src.get()), fileno(dest.get()));
