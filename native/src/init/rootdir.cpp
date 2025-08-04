@@ -44,7 +44,7 @@ static bool unxz(int fd, rust::Slice<const uint8_t> bytes) {
     return true;
 }
 
-// The new recursive function that adds imports for NEW files only.
+// The new recursive function that adds imports for NEW files only and mounts them.
 static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const char *system_path) {
     if (auto dir = opendir(overlay_path)) {
         for (dirent *entry; (entry = readdir(dir));) {
@@ -60,17 +60,29 @@ static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const
             if (stat(next_overlay_path, &st) != 0) continue;
 
             if (S_ISDIR(st.st_mode)) {
-                // It's a directory, recurse into it
+                // It's a directory, create it in the real filesystem if it doesn't exist, and recurse.
+                mkdir(next_system_path, 0755);
                 find_and_import_rc_files(dest, next_overlay_path, next_system_path);
             } else if (name.ends_with(".rc")) {
-                // --- THIS IS YOUR LOGIC ---
                 // Check if the file already exists in the real system.
-                // We only want to import BRAND NEW files.
                 if (access(next_system_path, F_OK) != 0) {
-                    LOGD("Custom Init: Found NEW rc script [%s], injecting import\n", next_system_path);
-                    fprintf(dest, "import %s\n", next_system_path);
+                    LOGD("Custom Init: Found NEW rc script [%s], injecting and mounting\n", next_system_path);
+                    
+                    // --- THE FINAL FIX ---
+                    // Create a dummy file at the destination.
+                    close(xopen(next_system_path, O_RDONLY | O_CREAT, 0644));
+                    // Bind mount our new file on top of the dummy file.
+                    if (xmount(next_overlay_path, next_system_path, nullptr, MS_BIND, nullptr) == 0) {
+                        LOGD("Custom Init: Successfully mounted [%s]\n", next_system_path);
+                        // Only add the import statement if the mount was successful.
+                        fprintf(dest, "import %s\n", next_system_path);
+                    } else {
+                        PLOGE("Custom Init: FAILED to mount [%s]", next_system_path);
+                    }
+                    // --- END OF FINAL FIX ---
+
                 } else {
-                    LOGD("Custom Init: File [%s] already exists, skipping import (it will be replaced by overlay)\n", next_system_path);
+                    LOGD("Custom Init: File [%s] already exists, skipping import (will be replaced by main overlay system)\n", next_system_path);
                 }
             }
         }
@@ -83,7 +95,6 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
     if (!src_dir) return false;
     int src_fd = dirfd(src_dir.get());
 
-    // If writable, directly modify the file in src_path, or else add to rootfs overlay    
     auto dest_dir = writable ? [&] {
         return xopen_dir(src_path);
     }() : [&] {
@@ -94,8 +105,6 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
     }();
     if (!dest_dir) return false;
     int dest_fd = dirfd(dest_dir.get());
-
-    // First patch init.rc    
 
     {
         auto src = xopen_file(xopenat(src_fd, INIT_RC, O_RDONLY | O_CLOEXEC, 0), "re");
@@ -108,7 +117,6 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
 
         bool import_injected = false;
         file_readline(false, src.get(), [&dest, &import_injected](string_view line) -> bool {
-            // --- START OF FIX: Use .get() to pass the raw pointer ---
             if (str_contains(line, "start vaultkeeper")) { return true; }
             if (line.starts_with("service flash_recovery")) {
                 fprintf(dest.get(), "service flash_recovery /system/bin/true\n");
@@ -131,7 +139,6 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
                 import_injected = true;
             }
             return true;
-            // --- END OF FIX ---
         });
 
         rust::inject_magisk_rc(fileno(src.get()), tmp_path);
@@ -152,7 +159,6 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
         LOGD("Patching %s in %s\n", name.data(), src_path);
 
         file_readline(false, src.get(), [&dest](string_view line) -> bool {
-            // --- START OF FIX: Use .get() to pass the raw pointer ---
             if (line.starts_with("service zygote ")) {
                 LOGD("Custom Init: Zygote modification disabled\n");
                 fprintf(dest.get(), "%s", line.data());
@@ -160,7 +166,6 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
             }
             fprintf(dest.get(), "%s", line.data());
             return true;
-            // --- END OF FIX ---
         });
         fclone_attr(fileno(src.get()), fileno(dest.get()));
     }
