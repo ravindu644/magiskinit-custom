@@ -45,7 +45,7 @@ static bool unxz(int fd, rust::Slice<const uint8_t> bytes) {
     return true;
 }
 
-// The new recursive function that does all the magic
+// The new recursive function with a superior logic
 static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const char *system_path) {
     if (auto dir = opendir(overlay_path)) {
         for (dirent *entry; (entry = readdir(dir));) {
@@ -61,26 +61,33 @@ static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const
             if (lstat(next_overlay_path, &s) != 0) continue;
 
             if (S_ISDIR(s.st_mode)) {
-                // It's a directory, recurse into it
                 find_and_import_rc_files(dest, next_overlay_path, next_system_path);
             } else if (name.ends_with(".rc")) {
-                // It's an RC file, perform the injection and SELinux magic
-                LOGD("Custom Init: Found new rc script at [%s]\n", next_system_path);
+                
+                // --- START OF THE "ONLY IMPORT IF NEW" LOGIC ---
+                // Check if the file already exists on the real system.
+                if (access(next_system_path, F_OK) == 0) {
+                    // This file is a replacement for an existing system file.
+                    // The overlay system will handle it automatically. Do nothing.
+                    LOGD("Custom Init: Replacing existing file [%s], skipping import.\n", next_system_path);
+                    continue; 
+                }
+                // ---  END OF THE "ONLY IMPORT IF NEW" LOGIC  ---
 
-                // --- START OF SELINUX MIMICKING ---
+                // If we reach here, the file is brand new and needs to be imported.
+                LOGD("Custom Init: Found new rc script at [%s], importing.\n", next_system_path);
+
+                // SELinux Mimicking Logic
                 security_context_t parent_context = nullptr;
                 char parent_dir_path[PATH_MAX];
                 ssprintf(parent_dir_path, sizeof(parent_dir_path), "%s", system_path);
 
-                // Get the context of the parent directory on the real filesystem
                 if (getfilecon(parent_dir_path, &parent_context) < 0) {
                     PLOGE("Custom Init: Could not get SELinux context for parent [%s]", parent_dir_path);
-                    // Fallback to a known-good context if we fail
                     if (setfilecon(next_overlay_path, "u:object_r:system_file:s0") != 0) {
                         PLOGE("Custom Init: Failed to set fallback context on [%s]", name.data());
                     }
                 } else {
-                    // Apply the parent directory's context to our new file
                     if (setfilecon(next_overlay_path, parent_context) == 0) {
                         LOGD("Custom Init: Applied context [%s] to [%s]\n", parent_context, name.data());
                     } else {
@@ -88,9 +95,7 @@ static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const
                     }
                     freecon(parent_context);
                 }
-                // ---  END OF SELINUX MIMICKING  ---
 
-                // Write the clean, final import path to init.rc
                 fprintf(dest, "import %s\n", next_system_path);
             }
         }
@@ -125,34 +130,23 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
 
         bool import_injected = false;
         file_readline(false, src.get(), [&dest, &import_injected](string_view line) -> bool {
-            if (str_contains(line, "start vaultkeeper")) {
-                LOGD("Custom Init: Removing vaultkeeper\n");
-                return true;
-            }
+            if (str_contains(line, "start vaultkeeper")) { return true; }
             if (line.starts_with("service flash_recovery")) {
-                LOGD("Custom Init: Removing flash_recovery\n");
                 fprintf(dest, "service flash_recovery /system/bin/true\n");
                 return true;
             }
             if (line.starts_with("on property:persist.sys.zygote.early=")) {
-                LOGD("Custom Init: Invalidating persist.sys.zygote.early\n");
                 fprintf(dest, "on property:persist.sys.zygote.early.xxxxx=true\n");
                 return true;
             }
 
             fprintf(dest, "%s", line.data());
 
-            // --- START OF THE "INJECT AT THE TOP" LOGIC ---
-            // After writing the first 'import' line, inject our own.
             if (!import_injected && str_contains(line, "import ")) {
                 fprintf(dest, "\n# [Custom Init] Import all custom rc scripts from ramdisk overlay\n");
-                
-                // Start scanning from the root of the overlay for maximum flexibility
                 find_and_import_rc_files(dest, ROOTOVL, "");
-
                 import_injected = true;
             }
-            // ---  END OF THE "INJECT AT THE TOP" LOGIC  ---
             return true;
         });
 
