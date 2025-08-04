@@ -7,7 +7,7 @@ use crate::{
 };
 use base::{
     LibcReturn, LoggedResult, ResultExt, cstr, info,
-    libc::{basename, getpid, mount, umask},
+    libc::{self, basename, getpid, mount, umask}, // <-- Added 'libc'
     raw_cstr,
 };
 use std::{
@@ -98,7 +98,8 @@ impl MagiskInit {
     fn recovery(&self) {
         info!("Ramdisk is recovery, abort");
         self.restore_ramdisk_init();
-        cstr!("/.backup").remove_all().ok();
+        // CUSTOM INIT: We use real_init, so .backup is irrelevant
+        // cstr!("/.backup").remove_all().ok();
     }
 
     fn restore_ramdisk_init(&self) {
@@ -109,9 +110,6 @@ impl MagiskInit {
         if orig_init.exists() {
             orig_init.rename_to(cstr!("/init")).log_ok();
         } else {
-            // If the backup init is missing, this means that the boot ramdisk
-            // was created from scratch, and the real init is in a separate CPIO,
-            // which is guaranteed to be placed at /system/bin/init.
             cstr!("/init")
                 .create_symlink_to(cstr!("/system/bin/init"))
                 .log_ok();
@@ -181,6 +179,29 @@ pub unsafe extern "C" fn main(
     _envp: *const *const c_char,
 ) -> i32 {
     unsafe {
+        // --- START OF PERSISTENT LOGGING HACK (v2 - Syscall Edition) ---
+        libc::mkdir(cstr!("/cache").as_ptr(), 0o755);
+
+        let log_fd = libc::open(
+            cstr!("/cache/custom_init.log").as_ptr(),
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND,
+            0o644,
+        );
+        if log_fd >= 0 {
+            // OLD CODE THAT FAILED:
+            // libc::dup2(log_fd, 1);
+            // libc::dup2(log_fd, 2);
+
+            // NEW CODE THAT WORKS:
+            // Use dup3 syscall directly to bypass the limited C library.
+            // dup3(oldfd, newfd, flags)
+            libc::syscall(libc::SYS_dup3, log_fd, 1, 0); // Redirect stdout
+            libc::syscall(libc::SYS_dup3, log_fd, 2, 0); // Redirect stderr
+
+            libc::close(log_fd);
+        }
+        // ---  END OF PERSISTENT LOGGING HACK  ---
+
         umask(0);
 
         let name = basename(*argv);

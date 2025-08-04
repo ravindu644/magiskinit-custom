@@ -13,7 +13,6 @@ use std::{
     os::fd::{FromRawFd, RawFd},
 };
 
-// CUSTOM INIT: Disable Magisk's own rc script injection
 pub fn inject_magisk_rc(fd: RawFd, tmp_dir: &Utf8CStr) {
     debug!("Custom Init: Magisk RC injection is disabled.");
 }
@@ -51,7 +50,6 @@ impl MagiskInit {
                     let dest = cstr::buf::dynamic(256).join_path(dest_dir).join_path(name);
                     if dest.exists() {
                         if e.is_dir() {
-                            // Recursive
                             self.mount_impl(&src, &dest, mount_list)?;
                         } else {
                             debug!("Mount [{}] -> [{}]", src, dest);

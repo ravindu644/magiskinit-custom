@@ -1,5 +1,6 @@
 #include <sys/mount.h>
 #include <libgen.h>
+#include <dirent.h>
 
 #include <sepolicy.hpp>
 #include <consts.hpp>
@@ -70,18 +71,18 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
         file_readline(false, src.get(), [&dest](string_view line) -> bool {
             // Do not start vaultkeeper
             if (str_contains(line, "start vaultkeeper")) {
-                LOGD("Remove vaultkeeper\n");
+                LOGD("Custom Init: Removing vaultkeeper\n");
                 return true;
             }
             // Do not run flash_recovery
             if (line.starts_with("service flash_recovery")) {
-                LOGD("Remove flash_recovery\n");
+                LOGD("Custom Init: Removing flash_recovery\n");
                 fprintf(dest.get(), "service flash_recovery /system/bin/true\n");
                 return true;
             }
             // Samsung's persist.sys.zygote.early will cause Zygote to start before post-fs-data
             if (line.starts_with("on property:persist.sys.zygote.early=")) {
-                LOGD("Invalidate persist.sys.zygote.early\n");
+                LOGD("Custom Init: Invalidating persist.sys.zygote.early\n");
                 fprintf(dest.get(), "on property:persist.sys.zygote.early.xxxxx=true\n");
                 return true;
             }
@@ -90,9 +91,28 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
             return true;
         });
 
-        fprintf(dest.get(), "\n");
+        fprintf(dest.get(), "\n# [Custom Init] Import all custom rc scripts from ramdisk\n");
+        
+        char rc_dir_path[PATH_MAX];
+        // --- START OF FIX ---
+        // Use ssprintf instead of snprintf to follow Magisk's coding conventions
+        ssprintf(rc_dir_path, sizeof(rc_dir_path), "%s/rc.d", ROOTOVL);
+        // ---  END OF FIX  ---
 
-        // CUSTOM INIT: Skip injecting Magisk-specific rc scripts by calling an empty function
+        if (auto dir = opendir(rc_dir_path)) {
+            for (dirent *entry; (entry = readdir(dir));) {
+                std::string_view name(entry->d_name);
+                if (name.ends_with(".rc")) {
+                    LOGD("Custom Init: Found script, importing [%s]\n", name.data());
+                    fprintf(dest.get(), "import /overlay.d/rc.d/%s\n", name.data());
+                }
+            }
+            closedir(dir);
+        } else {
+            PLOGE("Custom Init: Could not open directory [%s] to scan for rc scripts", rc_dir_path);
+        }
+
+        // We call our neutered Rust function, so this does nothing.
         rust::inject_magisk_rc(fileno(dest.get()), tmp_path);
 
         fclone_attr(fileno(src.get()), fileno(dest.get()));
@@ -102,15 +122,18 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
     for (dirent *entry; (entry = readdir(src_dir.get()));) {
         auto name = std::string_view(entry->d_name);
         if (!name.starts_with("init.zygote") || !name.ends_with(".rc")) continue;
+        
         auto src = xopen_file(xopenat(src_fd, name.data(), O_RDONLY | O_CLOEXEC, 0), "re");
+
         if (!src) continue;
         if (writable) unlinkat(src_fd, name.data(), 0);
         auto dest = xopen_file(
                 xopenat(dest_fd, name.data(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0), "we");
         if (!dest) continue;
         LOGD("Patching %s in %s\n", name.data(), src_path);
-        file_readline(false, src.get(), [&dest, &tmp_path](string_view line) -> bool {
-            // CUSTOM INIT: Disable Zygisk injection
+
+        file_readline(false, src.get(), [&dest](string_view line) -> bool {
+            // Disable Zygisk injection
             if (line.starts_with("service zygote ")) {
                 LOGD("Custom Init: Zygote modification disabled\n");
                 fprintf(dest.get(), "%s", line.data());
@@ -169,10 +192,8 @@ static void load_overlay_rc(const char *overlay) {
     if (!dir) return;
 
     int dfd = dirfd(dir.get());
-    // Do not allow overwrite init.rc
     unlinkat(dfd, INIT_RC, 0);
 
-    // '/' + name + '\0'
     char buf[NAME_MAX + 2];
     buf[0] = '/';
     for (dirent *entry; (entry = xreaddir(dir.get()));) {
@@ -207,7 +228,6 @@ static void recreate_sbin(const char *mirror, bool use_bind_mount) {
             sprintf(buf, "%s/%s", mirror, entry->d_name);
             if (use_bind_mount) {
                 auto mode = st.st_mode & 0777;
-                // Create dummy
                 if (S_ISDIR(st.st_mode))
                     xmkdir(sbin_path.data(), mode);
                 else
@@ -267,13 +287,11 @@ void MagiskInit::patch_ro_root() noexcept {
     chdir(tmp_dir.data());
 
     if (tmp_dir == "/sbin") {
-        // Recreate original sbin structure
         xmkdir(MIRRDIR, 0755);
         xmount("/", MIRRDIR, nullptr, MS_BIND, nullptr);
         recreate_sbin(MIRRDIR "/sbin", true);
         xumount2(MIRRDIR, MNT_DETACH);
     } else {
-        // Restore debug_ramdisk
         xmount("/data/debug_ramdisk", "/debug_ramdisk", nullptr, MS_MOVE, nullptr);
         rmdir("/data/debug_ramdisk");
     }
@@ -281,11 +299,9 @@ void MagiskInit::patch_ro_root() noexcept {
     xrename("overlay.d", ROOTOVL);
 
     extern bool avd_hack;
-    // Handle avd hack
     if (avd_hack) {
         int src = xopen("/init", O_RDONLY | O_CLOEXEC);
         mmap_data init("/init");
-        // Force disable early mount on original init
         for (size_t off : init.patch("android,fstab", "xxx")) {
             LOGD("Patch @ %08zX [android,fstab] -> [xxx]\n", off);
         }
@@ -298,29 +314,21 @@ void MagiskInit::patch_ro_root() noexcept {
 
     load_overlay_rc(ROOTOVL);
     if (access(ROOTOVL "/sbin", F_OK) == 0) {
-        // Move files in overlay.d/sbin into tmp_dir
         mv_path(ROOTOVL "/sbin", ".");
     }
 
-    // Patch init.rc
     bool p;
     if (access(NEW_INITRC_DIR "/" INIT_RC, F_OK) == 0) {
-        // Android 11's new init.rc
         p = patch_rc_scripts(NEW_INITRC_DIR, tmp_dir.data(), false);
     } else {
         p = patch_rc_scripts("/", tmp_dir.data(), false);
     }
     if (p) patch_fissiond(tmp_dir.data());
 
-    // Extract overlay archives
     extract_files(false);
-
     handle_sepolicy();
     unlink("init-ld");
-
-    // Mount rootdir
     mount_overlay("/");
-
     chdir("/");
 }
 
@@ -331,18 +339,15 @@ void MagiskInit::patch_rw_root() noexcept {
     mount_list.emplace_back("/data");
     parse_config_file();
 
-    // Create hardlink mirror of /sbin to /root
     mkdir("/root", 0777);
     clone_attr("/sbin", "/root");
     link_path("/sbin", "/root");
 
-    // Handle overlays
     load_overlay_rc("/overlay.d");
     mv_path("/overlay.d", "/");
     rm_rf("/data/overlay.d");
     rm_rf("/.backup");
 
-    // Patch init.rc
     if (patch_rc_scripts("/", "/sbin", true))
         patch_fissiond("/sbin");
 
@@ -352,15 +357,10 @@ void MagiskInit::patch_rw_root() noexcept {
     setup_tmp(PRE_TMPDIR);
     chdir(PRE_TMPDIR);
 
-    // Extract overlay archives
     extract_files(true);
-
     handle_sepolicy();
     unlink("init-ld");
-
     chdir("/");
-
-    // Dump magiskinit as magisk
     cp_afc(REDIR_PATH, "/sbin/magisk");
 }
 
@@ -368,23 +368,14 @@ int magisk_proxy_main(int, char *argv[]) {
     rust::setup_klog();
     LOGD("%s\n", __FUNCTION__);
 
-    // Mount rootfs as rw to do post-init rootfs patches
     xmount(nullptr, "/", nullptr, MS_REMOUNT, nullptr);
-
     unlink("/sbin/magisk");
-
-    // Move tmpfs to /sbin
-    // make parent private before MS_MOVE
     xmount(nullptr, PRE_TMPSRC, nullptr, MS_PRIVATE, nullptr);
     xmount(PRE_TMPDIR, "/sbin", nullptr, MS_MOVE, nullptr);
     xumount2(PRE_TMPSRC, MNT_DETACH);
     rmdir(PRE_TMPDIR);
     rmdir(PRE_TMPSRC);
-
-    // Create symlinks pointing back to /root
     recreate_sbin("/root", false);
-
-    // Tell magiskd to remount rootfs
     setenv("REMOUNT_ROOT", "1", 1);
     execve("/sbin/magisk", argv, environ);
     return 1;
@@ -399,7 +390,6 @@ static void unxz_init(const char *init_xz, const char *init) {
     unlink(init_xz);
 }
 
-// CUSTOM INIT: Use /real_init instead of /.backup/init
 rust::Utf8CStr backup_init() {
     if (access("/real_init.xz", F_OK) == 0)
         unxz_init("/real_init.xz", "/real_init");
