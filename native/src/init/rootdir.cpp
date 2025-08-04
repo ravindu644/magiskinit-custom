@@ -92,15 +92,7 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
 
         fprintf(dest.get(), "\n");
 
-        // Inject custom rc scripts
-        for (auto &script : rc_list) {
-            // Replace template arguments of rc scripts with dynamic paths
-            replace_all(script, "${MAGISKTMP}", tmp_path);
-            fprintf(dest.get(), "\n%s\n", script.data());
-        }
-        rc_list.clear();
-
-        // Inject Magisk rc scripts
+        // CUSTOM INIT: Skip injecting Magisk-specific rc scripts by calling an empty function
         rust::inject_magisk_rc(fileno(dest.get()), tmp_path);
 
         fclone_attr(fileno(src.get()), fileno(dest.get()));
@@ -118,11 +110,10 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
         if (!dest) continue;
         LOGD("Patching %s in %s\n", name.data(), src_path);
         file_readline(false, src.get(), [&dest, &tmp_path](string_view line) -> bool {
+            // CUSTOM INIT: Disable Zygisk injection
             if (line.starts_with("service zygote ")) {
-                LOGD("Inject zygote restart\n");
+                LOGD("Custom Init: Zygote modification disabled\n");
                 fprintf(dest.get(), "%s", line.data());
-                fprintf(dest.get(),
-                        "    onrestart exec " MAGISK_PROC_CON " 0 0 -- %s/magisk --zygote-restart\n", tmp_path);
                 return true;
             }
             fprintf(dest.get(), "%s", line.data());
@@ -408,8 +399,9 @@ static void unxz_init(const char *init_xz, const char *init) {
     unlink(init_xz);
 }
 
+// CUSTOM INIT: Use /real_init instead of /.backup/init
 rust::Utf8CStr backup_init() {
-    if (access("/.backup/init.xz", F_OK) == 0)
-        unxz_init("/.backup/init.xz", "/.backup/init");
-    return "/.backup/init";
+    if (access("/real_init.xz", F_OK) == 0)
+        unxz_init("/real_init.xz", "/real_init");
+    return "/real_init";
 }

@@ -13,34 +13,9 @@ use std::{
     os::fd::{FromRawFd, RawFd},
 };
 
+// CUSTOM INIT: Disable Magisk's own rc script injection
 pub fn inject_magisk_rc(fd: RawFd, tmp_dir: &Utf8CStr) {
-    debug!("Injecting magisk rc");
-
-    let mut file = unsafe { File::from_raw_fd(fd) };
-
-    write!(
-        file,
-        r#"
-on post-fs-data
-    exec {0} 0 0 -- {1}/magisk --post-fs-data
-
-on property:vold.decrypt=trigger_restart_framework
-    exec {0} 0 0 -- {1}/magisk --service
-
-on nonencrypted
-    exec {0} 0 0 -- {1}/magisk --service
-
-on property:sys.boot_completed=1
-    exec {0} 0 0 -- {1}/magisk --boot-complete
-
-on property:init.svc.zygote=stopped
-    exec {0} 0 0 -- {1}/magisk --zygote-restart
-"#,
-        "u:r:magisk:s0", tmp_dir
-    )
-    .ok();
-
-    mem::forget(file)
+    debug!("Custom Init: Magisk RC injection is disabled.");
 }
 
 pub struct OverlayAttr(Utf8CString, Utf8CString);
