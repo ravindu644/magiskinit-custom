@@ -1,5 +1,4 @@
 #include <sys/mount.h>
-#include <libgen.h>
 #include <dirent.h>
 
 #include <sepolicy.hpp>
@@ -44,6 +43,19 @@ static bool unxz(int fd, rust::Slice<const uint8_t> bytes) {
     return true;
 }
 
+// Simple dirname implementation for nolibc environment
+static void get_parent_dir(const char *path, char *parent, size_t parent_size) {
+    strscpy(parent, path, parent_size);
+    char *last_slash = strrchr(parent, '/');
+    if (last_slash && last_slash != parent) {
+        *last_slash = '\0';
+    } else if (last_slash == parent) {
+        parent[1] = '\0';  // Root directory
+    } else {
+        strscpy(parent, ".", parent_size);  // No slash found
+    }
+}
+
 // The new recursive function that adds imports for NEW files only and mounts them.
 static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const char *system_path) {
     if (auto dir = opendir(overlay_path)) {
@@ -53,8 +65,14 @@ static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const
 
             char next_overlay_path[PATH_MAX];
             ssprintf(next_overlay_path, sizeof(next_overlay_path), "%s/%s", overlay_path, name.data());
+            
             char next_system_path[PATH_MAX];
-            ssprintf(next_system_path, sizeof(next_system_path), "%s/%s", system_path, name.data());
+            // Fix: Handle the root system path case properly
+            if (strlen(system_path) == 0) {
+                ssprintf(next_system_path, sizeof(next_system_path), "/%s", name.data());
+            } else {
+                ssprintf(next_system_path, sizeof(next_system_path), "%s/%s", system_path, name.data());
+            }
 
             struct stat st;
             if (stat(next_overlay_path, &st) != 0) continue;
@@ -69,6 +87,11 @@ static void find_and_import_rc_files(FILE *dest, const char *overlay_path, const
                     LOGD("Custom Init: Found NEW rc script [%s], injecting and mounting\n", next_system_path);
                     
                     // --- THE FINAL FIX ---
+                    // Create the directory structure if it doesn't exist
+                    char parent_dir[PATH_MAX];
+                    get_parent_dir(next_system_path, parent_dir, sizeof(parent_dir));
+                    xmkdirs(parent_dir, 0755);
+                    
                     // Create a dummy file at the destination.
                     close(xopen(next_system_path, O_RDONLY | O_CREAT, 0644));
                     // Bind mount our new file on top of the dummy file.
@@ -116,7 +139,7 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
         LOGD("Patching " INIT_RC " in %s\n", src_path);
 
         bool import_injected = false;
-        file_readline(false, src.get(), [&dest, &import_injected](string_view line) -> bool {
+        file_readline(false, src.get(), [&dest, &import_injected, tmp_path](string_view line) -> bool {
             if (str_contains(line, "start vaultkeeper")) { return true; }
             if (line.starts_with("service flash_recovery")) {
                 fprintf(dest.get(), "service flash_recovery /system/bin/true\n");
@@ -132,6 +155,7 @@ static bool patch_rc_scripts(const char *src_path, const char *tmp_path, bool wr
             if (!import_injected && str_contains(line, "import ")) {
                 fprintf(dest.get(), "\n# [Custom Init] Import all new rc scripts from ramdisk\n");
                 
+                // Fix: Start the search from the overlay root and map to actual system paths
                 char overlay_root[PATH_MAX];
                 ssprintf(overlay_root, sizeof(overlay_root), "%s", ROOTOVL);
                 find_and_import_rc_files(dest.get(), overlay_root, "");
